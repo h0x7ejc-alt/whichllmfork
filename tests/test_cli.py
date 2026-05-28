@@ -18,7 +18,7 @@ from whichllm.cli import (
     app,
 )
 from whichllm.utils import _current_version
-from whichllm.engine.types import CompatibilityResult
+from whichllm.engine.types import CompatibilityResult, ScoreBreakdown
 from whichllm.hardware.types import GPUInfo, HardwareInfo
 from whichllm.models.types import GGUFVariant, ModelInfo
 from typer.testing import CliRunner
@@ -638,3 +638,171 @@ def test_json_output_includes_benchmark_source_and_confidence():
     assert entry["benchmark_status"] == "estimated"
     assert entry["benchmark_source"] == "line_interp"
     assert entry["benchmark_confidence"] == 0.34
+    assert entry["score_breakdown"] is None
+
+
+def test_json_output_includes_score_breakdown_when_explain_enabled():
+    import json as json_mod
+    from io import StringIO
+
+    from rich.console import Console
+
+    from whichllm.output.display import display_json
+
+    model = ModelInfo(
+        id="test-org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=100,
+        likes=10,
+    )
+    result = CompatibilityResult(
+        model=model,
+        gguf_variant=None,
+        can_run=True,
+        vram_required_bytes=8_000_000_000,
+        vram_available_bytes=24_000_000_000,
+        quality_score=55.0,
+        benchmark_status="direct",
+        benchmark_source="direct",
+        benchmark_confidence=1.0,
+        score_breakdown=ScoreBreakdown(
+            benchmark_reference_score=75.0,
+            benchmark_contribution=46.5,
+            size_contribution=20.8,
+            quant_penalty=6.7,
+            fit_penalty=9.3,
+            final_score=55.0,
+        ),
+    )
+    hw = HardwareInfo(
+        gpus=[],
+        cpu_name="Test CPU",
+        cpu_cores=8,
+        ram_bytes=64 * 1024**3,
+        disk_free_bytes=500 * 1024**3,
+        os="linux",
+    )
+
+    buf = StringIO()
+    import whichllm.output.display as disp_mod
+
+    orig_console = disp_mod.console
+    disp_mod.console = Console(file=buf, force_terminal=False)
+    try:
+        display_json([result], hw, explain=True)
+    finally:
+        disp_mod.console = orig_console
+
+    data = json_mod.loads(buf.getvalue().strip())
+    breakdown = data["models"][0]["score_breakdown"]
+    assert breakdown["benchmark_reference_score"] == 75.0
+    assert breakdown["benchmark_contribution"] == 46.5
+    assert breakdown["size_contribution"] == 20.8
+    assert breakdown["quant_penalty"] == 6.7
+    assert breakdown["fit_penalty"] == 9.3
+    assert breakdown["final_score"] == 55.0
+
+
+def test_display_ranking_explain_shows_required_breakdown_lines():
+    from io import StringIO
+
+    from rich.console import Console
+
+    from whichllm.output.display import display_ranking
+
+    model = ModelInfo(
+        id="test-org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=100,
+        likes=10,
+    )
+    result = CompatibilityResult(
+        model=model,
+        gguf_variant=None,
+        can_run=True,
+        vram_required_bytes=8_000_000_000,
+        vram_available_bytes=24_000_000_000,
+        quality_score=55.0,
+        benchmark_status="direct",
+        benchmark_source="direct",
+        benchmark_confidence=1.0,
+        fit_type="partial_offload",
+        score_breakdown=ScoreBreakdown(
+            benchmark_reference_score=75.0,
+            benchmark_contribution=46.5,
+            size_contribution=20.8,
+            quant_penalty=6.7,
+            evidence_penalty=2.0,
+            fit_penalty=9.3,
+            speed_contribution=1.4,
+            final_score=55.0,
+        ),
+    )
+
+    buf = StringIO()
+    import whichllm.output.display as disp_mod
+
+    orig_console = disp_mod.console
+    disp_mod.console = Console(file=buf, force_terminal=False, width=120)
+    try:
+        display_ranking([result], has_gpu=True, show_status=True, explain=True)
+    finally:
+        disp_mod.console = orig_console
+
+    output = buf.getvalue()
+    assert "Ranking Explanation" in output
+    assert "benchmark source:" in output
+    assert "confidence:" in output
+    assert "size contribution:" in output
+    assert "quant penalty:" in output
+    assert "fit penalty:" in output
+
+
+def test_main_accepts_expain_alias(monkeypatch):
+    from types import SimpleNamespace
+
+    captured: dict[str, object] = {}
+    model = ModelInfo(
+        id="test-org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=100,
+        likes=10,
+        published_at="2026-01-01T00:00:00.000Z",
+    )
+    ranked = CompatibilityResult(
+        model=model,
+        gguf_variant=None,
+        can_run=True,
+        vram_required_bytes=8_000_000_000,
+        vram_available_bytes=24_000_000_000,
+        quality_score=55.0,
+    )
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(24)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [{"id": "x"}])
+    monkeypatch.setattr("whichllm.models.fetcher.dicts_to_models", lambda _: [model])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr(
+        "whichllm.models.grouper.group_models",
+        lambda models: [SimpleNamespace(base_model=models[0], variants=[])],
+    )
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", lambda *args, **kwargs: [ranked])
+    monkeypatch.setattr("whichllm.output.display.display_hardware", lambda hw: None)
+
+    def fake_display_ranking(results, **kwargs):
+        captured["explain"] = kwargs.get("explain")
+
+    monkeypatch.setattr("whichllm.output.display.display_ranking", fake_display_ranking)
+
+    result = CliRunner().invoke(app, ["--gpu", "RTX 4090", "--top", "1", "--expain"])
+
+    assert result.exit_code == 0
+    assert captured["explain"] is True

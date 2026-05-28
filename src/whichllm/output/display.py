@@ -168,6 +168,66 @@ def _top_pick_confidence(results: list[CompatibilityResult]) -> tuple[str, str]:
     return confidence, reason
 
 
+def _benchmark_source_label(source: str) -> str:
+    return {
+        "direct": "direct benchmark",
+        "variant": "inherited from variant",
+        "base_model": "inherited from base model",
+        "line_interp": "interpolated from model line",
+        "self_reported": "self-reported benchmark",
+        "none": "no benchmark",
+    }.get(source, source)
+
+
+def _format_signed(value: float) -> str:
+    return f"{value:+.1f}"
+
+
+def _display_explanations(results: list[CompatibilityResult]) -> None:
+    console.print()
+    console.print("[bold]Ranking Explanation[/]")
+    for i, result in enumerate(results, 1):
+        breakdown = result.score_breakdown
+        quant = effective_quant_type(result.model, result.gguf_variant)
+        benchmark_confidence = f"{result.benchmark_confidence * 100:.0f}%"
+        benchmark_reference = (
+            f"{breakdown.benchmark_reference_score:.1f}"
+            if breakdown.benchmark_reference_score is not None
+            else "n/a"
+        )
+        lines = [
+            f"[bold]{i}. {result.model.id}[/] — {quant} — score {result.quality_score:.1f}",
+            " · ".join(
+                [
+                    f"benchmark source: {_benchmark_source_label(result.benchmark_source)}",
+                    f"confidence: {benchmark_confidence}",
+                    f"reference: {benchmark_reference}",
+                ]
+            ),
+            f"benchmark contribution: {_format_signed(breakdown.benchmark_contribution)}",
+            f"size contribution: {_format_signed(breakdown.size_contribution)}",
+            f"quant penalty: {_format_signed(-breakdown.quant_penalty)}",
+            f"evidence penalty: {_format_signed(-breakdown.evidence_penalty)}",
+            f"fit penalty: {_format_signed(-breakdown.fit_penalty)} ({result.fit_type})",
+            f"speed contribution: {_format_signed(breakdown.speed_contribution)}",
+            f"popularity contribution: {_format_signed(breakdown.popularity_contribution)}",
+            f"source bonus: {_format_signed(breakdown.source_bonus)}",
+            f"generation bonus: {_format_signed(breakdown.generation_bonus)}",
+        ]
+        if abs(breakdown.derivative_penalty) > 0.05:
+            lines.append(
+                f"derivative penalty: {_format_signed(breakdown.derivative_penalty)}"
+            )
+        lines.append(f"final score: {breakdown.final_score:.1f}")
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title=f"Explain #{i}",
+                border_style="magenta",
+            )
+        )
+
+
 def display_hardware(hw: HardwareInfo) -> None:
     """Display hardware information panel."""
     lines: list[str] = []
@@ -240,6 +300,7 @@ def display_ranking(
     *,
     has_gpu: bool = True,
     show_status: bool = False,
+    explain: bool = False,
 ) -> None:
     """Display ranked model table."""
     if not results:
@@ -426,6 +487,9 @@ def display_ranking(
         if r.warnings:
             for w in r.warnings:
                 console.print(f"  [yellow]Warning #{i} {r.model.name}:[/] {w}")
+
+    if explain:
+        _display_explanations(results)
 
 
 def display_plan(
@@ -688,7 +752,12 @@ def display_plan_json(
     console.print_json(json.dumps(output, ensure_ascii=False))
 
 
-def display_json(results: list[CompatibilityResult], hardware: HardwareInfo) -> None:
+def display_json(
+    results: list[CompatibilityResult],
+    hardware: HardwareInfo,
+    *,
+    explain: bool = False,
+) -> None:
     """Output results as JSON."""
     output = {
         "hardware": {
@@ -737,6 +806,50 @@ def display_json(results: list[CompatibilityResult], hardware: HardwareInfo) -> 
                 "can_run": r.can_run,
                 "warnings": r.warnings,
                 "license": r.model.license,
+                "score_breakdown": (
+                    {
+                        "benchmark_reference_score": round(
+                            r.score_breakdown.benchmark_reference_score,
+                            2,
+                        )
+                        if r.score_breakdown.benchmark_reference_score is not None
+                        else None,
+                        "benchmark_contribution": round(
+                            r.score_breakdown.benchmark_contribution,
+                            2,
+                        ),
+                        "size_contribution": round(
+                            r.score_breakdown.size_contribution,
+                            2,
+                        ),
+                        "quant_penalty": round(r.score_breakdown.quant_penalty, 2),
+                        "evidence_penalty": round(
+                            r.score_breakdown.evidence_penalty,
+                            2,
+                        ),
+                        "fit_penalty": round(r.score_breakdown.fit_penalty, 2),
+                        "speed_contribution": round(
+                            r.score_breakdown.speed_contribution,
+                            2,
+                        ),
+                        "popularity_contribution": round(
+                            r.score_breakdown.popularity_contribution,
+                            2,
+                        ),
+                        "source_bonus": round(r.score_breakdown.source_bonus, 2),
+                        "generation_bonus": round(
+                            r.score_breakdown.generation_bonus,
+                            2,
+                        ),
+                        "derivative_penalty": round(
+                            r.score_breakdown.derivative_penalty,
+                            2,
+                        ),
+                        "final_score": round(r.score_breakdown.final_score, 2),
+                    }
+                    if explain
+                    else None
+                ),
             }
             for i, r in enumerate(results, 1)
         ],

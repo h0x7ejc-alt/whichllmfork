@@ -1,0 +1,687 @@
+diff --git a/src/whichllm/cli.py b/src/whichllm/cli.py
+index ebefb77..9be20ed 100644
+--- a/src/whichllm/cli.py
++++ b/src/whichllm/cli.py
+@@ -218,6 +218,12 @@ def main(
+         "--status",
+         help="Show runtime status columns (Speed/Fit) in ranking table",
+     ),
++    explain: bool = typer.Option(
++        False,
++        "--explain",
++        "--expain",
++        help="Show score breakdown for ranked results",
++    ),
+     min_params: Optional[float] = typer.Option(
+         None,
+         "--min-params",
+@@ -374,12 +380,17 @@ def main(
+ 
+     # Display results
+     if json_output:
+-        display_json(results, hardware)
++        display_json(results, hardware, explain=explain)
+     else:
+         console.print()
+         display_hardware(hardware)
+         console.print()
+-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
++        display_ranking(
++            results,
++            has_gpu=bool(hardware.gpus),
++            show_status=status,
++            explain=explain,
++        )
+         console.print()
+ 
+ 
+diff --git a/src/whichllm/engine/ranker.py b/src/whichllm/engine/ranker.py
+index 8210968..e35b773 100644
+--- a/src/whichllm/engine/ranker.py
++++ b/src/whichllm/engine/ranker.py
+@@ -15,7 +15,7 @@ from whichllm.constants import (
+ from whichllm.engine.compatibility import check_compatibility
+ from whichllm.engine.performance import estimate_speed_uncertainty, estimate_tok_per_sec
+ from whichllm.engine.quantization import effective_quant_type, quant_quality_penalty
+-from whichllm.engine.types import CompatibilityResult
++from whichllm.engine.types import CompatibilityResult, ScoreBreakdown
+ from whichllm.hardware.types import HardwareInfo
+ from whichllm.models.benchmark import (
+     BenchmarkEvidence,
+@@ -434,7 +434,7 @@ def _is_gguf_only_backend(hardware: HardwareInfo) -> bool:
+     return not has_linux_nvidia
+ 
+ 
+-def _compute_quality_score(
++def _compute_score_breakdown(
+     model: ModelInfo,
+     variant: GGUFVariant | None,
+     tok_per_sec: float,
+@@ -443,19 +443,7 @@ def _compute_quality_score(
+     family_likes: int = 0,
+     benchmark_avg: float | None = None,
+     benchmark_source: str = "none",
+-) -> float:
+-    """Compute a quality score (0-100) for ranking.
+-
+-    Factors:
+-    - Benchmark score weighted by source tier
+-    - Model size (log scale)
+-    - Quantization penalty
+-    - Fit type penalty (partial offload / CPU-only heavily penalized)
+-    - Speed bonus / penalty (practical usability)
+-    - Popularity (downloads/likes) as soft tie-breaker
+-    - Official org bonus (vs known repackagers)
+-    - Generation-lineage bonus (newest family member > legacy generation)
+-    """
++) -> ScoreBreakdown:
+     params_b = model.parameter_count / 1e9
+     if model.is_moe and model.parameter_count_active:
+         effective_b = model.parameter_count_active / 1e9
+@@ -463,15 +451,8 @@ def _compute_quality_score(
+         effective_b = params_b
+ 
+     if effective_b <= 0:
+-        return 0.0
++        return ScoreBreakdown()
+ 
+-    # Benchmarks lead, but raw model size also matters: a 70B at Q4_K_M
+-    # carries far more world knowledge than a 7B Q4_K_M even when the
+-    # leaderboard score gap is modest. For MoE models, knowledge capacity
+-    # tracks *total* params (every expert contributes to what the model
+-    # knows), while routing keeps per-token compute small. Use total params
+-    # for the size score and let the speed term separately reward MoE
+-    # efficiency.
+     size_basis_b = params_b
+     size_score = 4.2 * math.log2(max(size_basis_b, 0.5)) + 9
+     size_score = min(size_score, 35)
+@@ -481,31 +462,35 @@ def _compute_quality_score(
+     is_self_reported = benchmark_source == "self_reported"
+     is_inherited = benchmark_source in {"variant", "base_model", "line_interp"}
+ 
+-    bench_weight = _SOURCE_WEIGHTS.get(benchmark_source, 0.0)
+-    benchmark_score = 0.0
++    benchmark_reference_score = None
++    benchmark_contribution = 0.0
+     if has_benchmark:
+-        raw = min(100.0, benchmark_avg)
+-        benchmark_score = raw * bench_weight
++        benchmark_reference_score = min(100.0, benchmark_avg)
++        benchmark_contribution = benchmark_reference_score * _SOURCE_WEIGHTS.get(
++            benchmark_source, 0.0
++        )
+ 
+-    # Quantization penalty
+-    quant_penalty = quant_quality_penalty(model, variant)
+-    quality_core = (benchmark_score + size_score) * (1 - quant_penalty)
++    quant_penalty_ratio = quant_quality_penalty(model, variant)
++    pre_quant_score = benchmark_contribution + size_score
++    quant_penalty = pre_quant_score * quant_penalty_ratio
++    after_quant_score = pre_quant_score - quant_penalty
+ 
+-    # Weak / unverifiable evidence gets an extra discount.
+-    if not has_benchmark:
+-        quality_core *= 0.55
+-    elif is_self_reported:
+-        quality_core *= 0.55  # uploader claim, easily fabricated
++    evidence_multiplier = 1.0
++    if not has_benchmark or is_self_reported:
++        evidence_multiplier = 0.55
+     elif is_inherited:
+-        quality_core *= 0.78
++        evidence_multiplier = 0.78
++    evidence_penalty = after_quant_score * (1 - evidence_multiplier)
++    after_evidence_score = after_quant_score - evidence_penalty
+ 
+-    # Runtime form factor penalty
++    fit_multiplier = 1.0
+     if fit_type == "partial_offload":
+-        quality_core *= 0.72
++        fit_multiplier = 0.72
+     elif fit_type == "cpu_only":
+-        quality_core *= 0.50
++        fit_multiplier = 0.50
++    fit_penalty = after_evidence_score * (1 - fit_multiplier)
++    quality_core = after_evidence_score - fit_penalty
+ 
+-    # Speed acts as a usability gate rather than a ranking primary.
+     required_speed = (
+         8.0
+         if fit_type == "full_gpu"
+@@ -519,7 +504,6 @@ def _compute_quality_score(
+     else:
+         speed_score = -8.0
+ 
+-    # Popularity is a tie-breaker, never primary.
+     downloads = max(model.downloads, family_downloads)
+     likes = max(model.likes, family_likes)
+     pop_score_raw = 0.0
+@@ -531,14 +515,13 @@ def _compute_quality_score(
+     if is_direct:
+         pop_weight = 0.0
+     elif is_self_reported:
+-        pop_weight = 0.4  # uploader claim is weak — popularity acts as sanity check
++        pop_weight = 0.4
+     elif has_benchmark:
+         pop_weight = 0.2
+     else:
+         pop_weight = 0.6
+     pop_score = pop_score_raw * pop_weight
+ 
+-    # Source-trust bonus stays small.
+     source_bonus_raw = 0.0
+     org = model.id.split("/")[0] if "/" in model.id else ""
+     if org in _OFFICIAL_ORGS:
+@@ -563,22 +546,15 @@ def _compute_quality_score(
+         source_weight = 0.6
+     source_bonus = source_bonus_raw * source_weight
+ 
+-    # Generation lineage bonus: newest in a known family gets a small boost,
+-    # confirmed legacy versions get a small penalty. Helps surface Qwen3.6,
+-    # DeepSeek V4, Gemma 4, etc. against accumulated download leaders.
+     gen_bonus = _generation_bonus(model.id)
+-    # When benchmark evidence is missing or self-reported, the lineage signal
+-    # carries more weight (we have less else to go on).
+     if not has_benchmark or is_self_reported:
+         gen_bonus *= 1.5
+     elif is_direct:
+         gen_bonus *= 0.6
+ 
+-    # Penalty for "uncensored / abliterated / heretic / RP" derivatives that
+-    # ride on a base model's score without independent benchmarking.
+     derivative_penalty = _derivative_name_penalty(model.id)
+ 
+-    return max(
++    final_score = max(
+         0.0,
+         min(
+             100.0,
+@@ -591,6 +567,43 @@ def _compute_quality_score(
+         ),
+     )
+ 
++    return ScoreBreakdown(
++        benchmark_reference_score=benchmark_reference_score,
++        benchmark_contribution=benchmark_contribution,
++        size_contribution=size_score,
++        quant_penalty=quant_penalty,
++        evidence_penalty=evidence_penalty,
++        fit_penalty=fit_penalty,
++        speed_contribution=speed_score,
++        popularity_contribution=pop_score,
++        source_bonus=source_bonus,
++        generation_bonus=gen_bonus,
++        derivative_penalty=derivative_penalty,
++        final_score=final_score,
++    )
++
++
++def _compute_quality_score(
++    model: ModelInfo,
++    variant: GGUFVariant | None,
++    tok_per_sec: float,
++    fit_type: str,
++    family_downloads: int = 0,
++    family_likes: int = 0,
++    benchmark_avg: float | None = None,
++    benchmark_source: str = "none",
++) -> float:
++    return _compute_score_breakdown(
++        model,
++        variant,
++        tok_per_sec,
++        fit_type,
++        family_downloads=family_downloads,
++        family_likes=family_likes,
++        benchmark_avg=benchmark_avg,
++        benchmark_source=benchmark_source,
++    ).final_score
++
+ 
+ def rank_models(
+     models: list[ModelInfo],
+@@ -736,7 +749,7 @@ def rank_models(
+                 compat.fit_type,
+                 tok_per_sec,
+             )
+-            compat.quality_score = _compute_quality_score(
++            compat.score_breakdown = _compute_score_breakdown(
+                 model,
+                 variant,
+                 tok_per_sec,
+@@ -746,6 +759,7 @@ def rank_models(
+                 benchmark_avg=bench_avg,
+                 benchmark_source=bench_evidence.source,
+             )
++            compat.quality_score = compat.score_breakdown.final_score
+             # Map evidence source to a 4-value display status. "self_reported"
+             # is shown distinctly so users can spot uploader-claimed numbers.
+             if bench_evidence.score is None:
+diff --git a/src/whichllm/engine/types.py b/src/whichllm/engine/types.py
+index 1201429..f681979 100644
+--- a/src/whichllm/engine/types.py
++++ b/src/whichllm/engine/types.py
+@@ -5,6 +5,22 @@ from dataclasses import dataclass, field
+ from whichllm.models.types import GGUFVariant, ModelInfo
+ 
+ 
++@dataclass
++class ScoreBreakdown:
++    benchmark_reference_score: float | None = None
++    benchmark_contribution: float = 0.0
++    size_contribution: float = 0.0
++    quant_penalty: float = 0.0
++    evidence_penalty: float = 0.0
++    fit_penalty: float = 0.0
++    speed_contribution: float = 0.0
++    popularity_contribution: float = 0.0
++    source_bonus: float = 0.0
++    generation_bonus: float = 0.0
++    derivative_penalty: float = 0.0
++    final_score: float = 0.0
++
++
+ @dataclass
+ class CompatibilityResult:
+     model: ModelInfo
+@@ -13,12 +29,13 @@ class CompatibilityResult:
+     vram_required_bytes: int
+     vram_available_bytes: int
+     estimated_tok_per_sec: float | None = None
+-    speed_confidence: str = "medium"  # "high" | "medium" | "low"
++    speed_confidence: str = "medium"
+     speed_range_tok_per_sec: tuple[float, float] | None = None
+     speed_notes: list[str] = field(default_factory=list)
+     warnings: list[str] = field(default_factory=list)
+-    quality_score: float = 0.0  # 0-100 for ranking
+-    fit_type: str = "full_gpu"  # "full_gpu" | "partial_offload" | "cpu_only"
+-    benchmark_status: str = "none"  # "direct" | "estimated" | "self_reported" | "none"
+-    benchmark_source: str = "none"  # granular: "direct" | "variant" | "base_model" | "line_interp" | "self_reported" | "none"
+-    benchmark_confidence: float = 0.0  # 0.0-1.0 from BenchmarkEvidence
++    quality_score: float = 0.0
++    fit_type: str = "full_gpu"
++    benchmark_status: str = "none"
++    benchmark_source: str = "none"
++    benchmark_confidence: float = 0.0
++    score_breakdown: ScoreBreakdown = field(default_factory=ScoreBreakdown)
+diff --git a/src/whichllm/output/display.py b/src/whichllm/output/display.py
+index 20fc8a9..7b6e406 100644
+--- a/src/whichllm/output/display.py
++++ b/src/whichllm/output/display.py
+@@ -168,6 +168,66 @@ def _top_pick_confidence(results: list[CompatibilityResult]) -> tuple[str, str]:
+     return confidence, reason
+ 
+ 
++def _benchmark_source_label(source: str) -> str:
++    return {
++        "direct": "direct benchmark",
++        "variant": "inherited from variant",
++        "base_model": "inherited from base model",
++        "line_interp": "interpolated from model line",
++        "self_reported": "self-reported benchmark",
++        "none": "no benchmark",
++    }.get(source, source)
++
++
++def _format_signed(value: float) -> str:
++    return f"{value:+.1f}"
++
++
++def _display_explanations(results: list[CompatibilityResult]) -> None:
++    console.print()
++    console.print("[bold]Ranking Explanation[/]")
++    for i, result in enumerate(results, 1):
++        breakdown = result.score_breakdown
++        quant = effective_quant_type(result.model, result.gguf_variant)
++        benchmark_confidence = f"{result.benchmark_confidence * 100:.0f}%"
++        benchmark_reference = (
++            f"{breakdown.benchmark_reference_score:.1f}"
++            if breakdown.benchmark_reference_score is not None
++            else "n/a"
++        )
++        lines = [
++            f"[bold]{i}. {result.model.id}[/] — {quant} — score {result.quality_score:.1f}",
++            " · ".join(
++                [
++                    f"benchmark source: {_benchmark_source_label(result.benchmark_source)}",
++                    f"confidence: {benchmark_confidence}",
++                    f"reference: {benchmark_reference}",
++                ]
++            ),
++            f"benchmark contribution: {_format_signed(breakdown.benchmark_contribution)}",
++            f"size contribution: {_format_signed(breakdown.size_contribution)}",
++            f"quant penalty: {_format_signed(-breakdown.quant_penalty)}",
++            f"evidence penalty: {_format_signed(-breakdown.evidence_penalty)}",
++            f"fit penalty: {_format_signed(-breakdown.fit_penalty)} ({result.fit_type})",
++            f"speed contribution: {_format_signed(breakdown.speed_contribution)}",
++            f"popularity contribution: {_format_signed(breakdown.popularity_contribution)}",
++            f"source bonus: {_format_signed(breakdown.source_bonus)}",
++            f"generation bonus: {_format_signed(breakdown.generation_bonus)}",
++        ]
++        if abs(breakdown.derivative_penalty) > 0.05:
++            lines.append(
++                f"derivative penalty: {_format_signed(breakdown.derivative_penalty)}"
++            )
++        lines.append(f"final score: {breakdown.final_score:.1f}")
++        console.print(
++            Panel(
++                "\n".join(lines),
++                title=f"Explain #{i}",
++                border_style="magenta",
++            )
++        )
++
++
+ def display_hardware(hw: HardwareInfo) -> None:
+     """Display hardware information panel."""
+     lines: list[str] = []
+@@ -240,6 +300,7 @@ def display_ranking(
+     *,
+     has_gpu: bool = True,
+     show_status: bool = False,
++    explain: bool = False,
+ ) -> None:
+     """Display ranked model table."""
+     if not results:
+@@ -427,6 +488,9 @@ def display_ranking(
+             for w in r.warnings:
+                 console.print(f"  [yellow]Warning #{i} {r.model.name}:[/] {w}")
+ 
++    if explain:
++        _display_explanations(results)
++
+ 
+ def display_plan(
+     model: ModelInfo,
+@@ -688,7 +752,12 @@ def display_plan_json(
+     console.print_json(json.dumps(output, ensure_ascii=False))
+ 
+ 
+-def display_json(results: list[CompatibilityResult], hardware: HardwareInfo) -> None:
++def display_json(
++    results: list[CompatibilityResult],
++    hardware: HardwareInfo,
++    *,
++    explain: bool = False,
++) -> None:
+     """Output results as JSON."""
+     output = {
+         "hardware": {
+@@ -737,6 +806,50 @@ def display_json(results: list[CompatibilityResult], hardware: HardwareInfo) ->
+                 "can_run": r.can_run,
+                 "warnings": r.warnings,
+                 "license": r.model.license,
++                "score_breakdown": (
++                    {
++                        "benchmark_reference_score": round(
++                            r.score_breakdown.benchmark_reference_score,
++                            2,
++                        )
++                        if r.score_breakdown.benchmark_reference_score is not None
++                        else None,
++                        "benchmark_contribution": round(
++                            r.score_breakdown.benchmark_contribution,
++                            2,
++                        ),
++                        "size_contribution": round(
++                            r.score_breakdown.size_contribution,
++                            2,
++                        ),
++                        "quant_penalty": round(r.score_breakdown.quant_penalty, 2),
++                        "evidence_penalty": round(
++                            r.score_breakdown.evidence_penalty,
++                            2,
++                        ),
++                        "fit_penalty": round(r.score_breakdown.fit_penalty, 2),
++                        "speed_contribution": round(
++                            r.score_breakdown.speed_contribution,
++                            2,
++                        ),
++                        "popularity_contribution": round(
++                            r.score_breakdown.popularity_contribution,
++                            2,
++                        ),
++                        "source_bonus": round(r.score_breakdown.source_bonus, 2),
++                        "generation_bonus": round(
++                            r.score_breakdown.generation_bonus,
++                            2,
++                        ),
++                        "derivative_penalty": round(
++                            r.score_breakdown.derivative_penalty,
++                            2,
++                        ),
++                        "final_score": round(r.score_breakdown.final_score, 2),
++                    }
++                    if explain
++                    else None
++                ),
+             }
+             for i, r in enumerate(results, 1)
+         ],
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index da3d241..f73e1a9 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -18,7 +18,7 @@ from whichllm.cli import (
+     app,
+ )
+ from whichllm.utils import _current_version
+-from whichllm.engine.types import CompatibilityResult
++from whichllm.engine.types import CompatibilityResult, ScoreBreakdown
+ from whichllm.hardware.types import GPUInfo, HardwareInfo
+ from whichllm.models.types import GGUFVariant, ModelInfo
+ from typer.testing import CliRunner
+@@ -638,3 +638,171 @@ def test_json_output_includes_benchmark_source_and_confidence():
+     assert entry["benchmark_status"] == "estimated"
+     assert entry["benchmark_source"] == "line_interp"
+     assert entry["benchmark_confidence"] == 0.34
++    assert entry["score_breakdown"] is None
++
++
++def test_json_output_includes_score_breakdown_when_explain_enabled():
++    import json as json_mod
++    from io import StringIO
++
++    from rich.console import Console
++
++    from whichllm.output.display import display_json
++
++    model = ModelInfo(
++        id="test-org/Test-7B",
++        family_id="test-7b",
++        name="Test-7B",
++        parameter_count=7_000_000_000,
++        downloads=100,
++        likes=10,
++    )
++    result = CompatibilityResult(
++        model=model,
++        gguf_variant=None,
++        can_run=True,
++        vram_required_bytes=8_000_000_000,
++        vram_available_bytes=24_000_000_000,
++        quality_score=55.0,
++        benchmark_status="direct",
++        benchmark_source="direct",
++        benchmark_confidence=1.0,
++        score_breakdown=ScoreBreakdown(
++            benchmark_reference_score=75.0,
++            benchmark_contribution=46.5,
++            size_contribution=20.8,
++            quant_penalty=6.7,
++            fit_penalty=9.3,
++            final_score=55.0,
++        ),
++    )
++    hw = HardwareInfo(
++        gpus=[],
++        cpu_name="Test CPU",
++        cpu_cores=8,
++        ram_bytes=64 * 1024**3,
++        disk_free_bytes=500 * 1024**3,
++        os="linux",
++    )
++
++    buf = StringIO()
++    import whichllm.output.display as disp_mod
++
++    orig_console = disp_mod.console
++    disp_mod.console = Console(file=buf, force_terminal=False)
++    try:
++        display_json([result], hw, explain=True)
++    finally:
++        disp_mod.console = orig_console
++
++    data = json_mod.loads(buf.getvalue().strip())
++    breakdown = data["models"][0]["score_breakdown"]
++    assert breakdown["benchmark_reference_score"] == 75.0
++    assert breakdown["benchmark_contribution"] == 46.5
++    assert breakdown["size_contribution"] == 20.8
++    assert breakdown["quant_penalty"] == 6.7
++    assert breakdown["fit_penalty"] == 9.3
++    assert breakdown["final_score"] == 55.0
++
++
++def test_display_ranking_explain_shows_required_breakdown_lines():
++    from io import StringIO
++
++    from rich.console import Console
++
++    from whichllm.output.display import display_ranking
++
++    model = ModelInfo(
++        id="test-org/Test-7B",
++        family_id="test-7b",
++        name="Test-7B",
++        parameter_count=7_000_000_000,
++        downloads=100,
++        likes=10,
++    )
++    result = CompatibilityResult(
++        model=model,
++        gguf_variant=None,
++        can_run=True,
++        vram_required_bytes=8_000_000_000,
++        vram_available_bytes=24_000_000_000,
++        quality_score=55.0,
++        benchmark_status="direct",
++        benchmark_source="direct",
++        benchmark_confidence=1.0,
++        fit_type="partial_offload",
++        score_breakdown=ScoreBreakdown(
++            benchmark_reference_score=75.0,
++            benchmark_contribution=46.5,
++            size_contribution=20.8,
++            quant_penalty=6.7,
++            evidence_penalty=2.0,
++            fit_penalty=9.3,
++            speed_contribution=1.4,
++            final_score=55.0,
++        ),
++    )
++
++    buf = StringIO()
++    import whichllm.output.display as disp_mod
++
++    orig_console = disp_mod.console
++    disp_mod.console = Console(file=buf, force_terminal=False, width=120)
++    try:
++        display_ranking([result], has_gpu=True, show_status=True, explain=True)
++    finally:
++        disp_mod.console = orig_console
++
++    output = buf.getvalue()
++    assert "Ranking Explanation" in output
++    assert "benchmark source:" in output
++    assert "confidence:" in output
++    assert "size contribution:" in output
++    assert "quant penalty:" in output
++    assert "fit penalty:" in output
++
++
++def test_main_accepts_expain_alias(monkeypatch):
++    from types import SimpleNamespace
++
++    captured: dict[str, object] = {}
++    model = ModelInfo(
++        id="test-org/Test-7B",
++        family_id="test-7b",
++        name="Test-7B",
++        parameter_count=7_000_000_000,
++        downloads=100,
++        likes=10,
++        published_at="2026-01-01T00:00:00.000Z",
++    )
++    ranked = CompatibilityResult(
++        model=model,
++        gguf_variant=None,
++        can_run=True,
++        vram_required_bytes=8_000_000_000,
++        vram_available_bytes=24_000_000_000,
++        quality_score=55.0,
++    )
++
++    monkeypatch.setattr(
++        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(24)
++    )
++    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [{"id": "x"}])
++    monkeypatch.setattr("whichllm.models.fetcher.dicts_to_models", lambda _: [model])
++    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
++    monkeypatch.setattr(
++        "whichllm.models.grouper.group_models",
++        lambda models: [SimpleNamespace(base_model=models[0], variants=[])],
++    )
++    monkeypatch.setattr("whichllm.engine.ranker.rank_models", lambda *args, **kwargs: [ranked])
++    monkeypatch.setattr("whichllm.output.display.display_hardware", lambda hw: None)
++
++    def fake_display_ranking(results, **kwargs):
++        captured["explain"] = kwargs.get("explain")
++
++    monkeypatch.setattr("whichllm.output.display.display_ranking", fake_display_ranking)
++
++    result = CliRunner().invoke(app, ["--gpu", "RTX 4090", "--top", "1", "--expain"])
++
++    assert result.exit_code == 0
++    assert captured["explain"] is True
+diff --git a/tests/test_ranker.py b/tests/test_ranker.py
+index 47684e3..d60a134 100644
+--- a/tests/test_ranker.py
++++ b/tests/test_ranker.py
+@@ -672,3 +672,37 @@ def test_benchmark_source_and_confidence_exposed_for_none():
+     assert results[0].benchmark_status == "none"
+     assert results[0].benchmark_source == "none"
+     assert results[0].benchmark_confidence == 0.0
++
++
++def test_score_breakdown_exposes_required_explain_fields():
++    model = ModelInfo(
++        id="Qwen/Qwen2.5-7B-Instruct",
++        family_id="qwen2.5-7b",
++        name="Qwen2.5-7B-Instruct",
++        parameter_count=7_000_000_000,
++        downloads=1000,
++        likes=100,
++        gguf_variants=[
++            GGUFVariant(
++                filename="a-Q4_K_M.gguf",
++                quant_type="Q4_K_M",
++                file_size_bytes=4_000_000_000,
++            ),
++        ],
++    )
++    hw = _make_hardware(vram_gb=5, bandwidth_gbps=120.0)
++    results = rank_models(
++        [model],
++        hw,
++        top_n=1,
++        benchmark_scores={"Qwen/Qwen2.5-7B-Instruct": 75.0},
++        task_profile="any",
++    )
++
++    assert results
++    breakdown = results[0].score_breakdown
++    assert breakdown.benchmark_contribution > 0.0
++    assert breakdown.size_contribution > 0.0
++    assert breakdown.quant_penalty > 0.0
++    assert breakdown.fit_penalty > 0.0
++    assert breakdown.final_score == results[0].quality_score

@@ -218,6 +218,12 @@ def main(
         "--status",
         help="Show runtime status columns (Speed/Fit) in ranking table",
     ),
+    explain: bool = typer.Option(
+        False,
+        "--explain",
+        "--expain",
+        help="Show score breakdown for ranked results",
+    ),
     min_params: Optional[float] = typer.Option(
         None,
         "--min-params",
@@ -374,12 +380,17 @@ def main(
 
     # Display results
     if json_output:
-        display_json(results, hardware)
+        display_json(results, hardware, explain=explain)
     else:
         console.print()
         display_hardware(hardware)
         console.print()
-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
+        display_ranking(
+            results,
+            has_gpu=bool(hardware.gpus),
+            show_status=status,
+            explain=explain,
+        )
         console.print()
 
 

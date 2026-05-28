@@ -672,3 +672,37 @@ def test_benchmark_source_and_confidence_exposed_for_none():
     assert results[0].benchmark_status == "none"
     assert results[0].benchmark_source == "none"
     assert results[0].benchmark_confidence == 0.0
+
+
+def test_score_breakdown_exposes_required_explain_fields():
+    model = ModelInfo(
+        id="Qwen/Qwen2.5-7B-Instruct",
+        family_id="qwen2.5-7b",
+        name="Qwen2.5-7B-Instruct",
+        parameter_count=7_000_000_000,
+        downloads=1000,
+        likes=100,
+        gguf_variants=[
+            GGUFVariant(
+                filename="a-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=4_000_000_000,
+            ),
+        ],
+    )
+    hw = _make_hardware(vram_gb=5, bandwidth_gbps=120.0)
+    results = rank_models(
+        [model],
+        hw,
+        top_n=1,
+        benchmark_scores={"Qwen/Qwen2.5-7B-Instruct": 75.0},
+        task_profile="any",
+    )
+
+    assert results
+    breakdown = results[0].score_breakdown
+    assert breakdown.benchmark_contribution > 0.0
+    assert breakdown.size_contribution > 0.0
+    assert breakdown.quant_penalty > 0.0
+    assert breakdown.fit_penalty > 0.0
+    assert breakdown.final_score == results[0].quality_score
