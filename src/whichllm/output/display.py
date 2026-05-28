@@ -428,6 +428,67 @@ def display_ranking(
                 console.print(f"  [yellow]Warning #{i} {r.model.name}:[/] {w}")
 
 
+def display_explain(results: list[CompatibilityResult]) -> None:
+    """Display score breakdown for top results."""
+    if not results:
+        return
+
+    for i, r in enumerate(results[:5], 1):
+        bd = r.score_breakdown
+        if bd is None:
+            continue
+
+        quant = effective_quant_type(r.model, r.gguf_variant)
+
+        bench_source_display = {
+            "direct": "[green]direct (independent leaderboard)[/green]",
+            "variant": "[yellow]variant-inherited[/yellow]",
+            "base_model": "[yellow]base-model-inherited[/yellow]",
+            "line_interp": "[yellow]linearly interpolated[/yellow]",
+            "self_reported": "[bright_yellow]self-reported (uploader claim)[/bright_yellow]",
+            "none": "[red]none[/red]",
+        }.get(bd.benchmark_source, bd.benchmark_source)
+
+        fit_display = {
+            "full_gpu": "[green]Full GPU[/green]",
+            "partial_offload": "[yellow]Partial Offload[/yellow]",
+            "cpu_only": "[red]CPU Only[/red]",
+        }.get(bd.fit_type, bd.fit_type)
+
+        lines = [
+            f"[bold cyan]Model:[/] {r.model.name}",
+            f"[bold cyan]Quant:[/] {quant}",
+            f"",
+            f"[bold]Score Breakdown:[/]",
+            f"  Benchmark Source:  {bench_source_display}",
+        ]
+
+        if bd.benchmark_score_raw is not None:
+            conf_str = f" (conf: {bd.benchmark_confidence:.0%})" if bd.benchmark_confidence > 0 else ""
+            lines.append(
+                f"  Raw Benchmark:     {bd.benchmark_score_raw:.1f} x weight {bd.benchmark_weight:.2f}{conf_str}"
+            )
+        else:
+            lines.append(f"  Raw Benchmark:     [dim]none[/dim]")
+
+        lines.extend([
+            f"  Size Score:        {bd.size_score:.2f}",
+            f"  Quant Penalty:     -{bd.quant_penalty * 100:.1f}%",
+            f"  Fit Type:         {fit_display}",
+            f"  Speed Score:       {bd.speed_score:+.2f}",
+            f"",
+            f"  Quality Core:     {bd.quality_core:.2f}",
+            f"  [bold]Final Score:[/bold]       {bd.final_score:.2f}",
+        ])
+
+        panel = Panel(
+            "\n".join(lines),
+            title=f"[bold]Score Breakdown #{i}[/bold]",
+            border_style="blue",
+        )
+        console.print(panel)
+
+
 def display_plan(
     model: ModelInfo,
     context_length: int,

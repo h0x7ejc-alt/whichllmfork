@@ -15,7 +15,7 @@ from whichllm.constants import (
 from whichllm.engine.compatibility import check_compatibility
 from whichllm.engine.performance import estimate_speed_uncertainty, estimate_tok_per_sec
 from whichllm.engine.quantization import effective_quant_type, quant_quality_penalty
-from whichllm.engine.types import CompatibilityResult
+from whichllm.engine.types import CompatibilityResult, ScoreBreakdown
 from whichllm.hardware.types import HardwareInfo
 from whichllm.models.benchmark import (
     BenchmarkEvidence,
@@ -443,7 +443,7 @@ def _compute_quality_score(
     family_likes: int = 0,
     benchmark_avg: float | None = None,
     benchmark_source: str = "none",
-) -> float:
+) -> tuple[float, ScoreBreakdown]:
     """Compute a quality score (0-100) for ranking.
 
     Factors:
@@ -462,16 +462,6 @@ def _compute_quality_score(
     else:
         effective_b = params_b
 
-    if effective_b <= 0:
-        return 0.0
-
-    # Benchmarks lead, but raw model size also matters: a 70B at Q4_K_M
-    # carries far more world knowledge than a 7B Q4_K_M even when the
-    # leaderboard score gap is modest. For MoE models, knowledge capacity
-    # tracks *total* params (every expert contributes to what the model
-    # knows), while routing keeps per-token compute small. Use total params
-    # for the size score and let the speed term separately reward MoE
-    # efficiency.
     size_basis_b = params_b
     size_score = 4.2 * math.log2(max(size_basis_b, 0.5)) + 9
     size_score = min(size_score, 35)
@@ -487,25 +477,21 @@ def _compute_quality_score(
         raw = min(100.0, benchmark_avg)
         benchmark_score = raw * bench_weight
 
-    # Quantization penalty
     quant_penalty = quant_quality_penalty(model, variant)
     quality_core = (benchmark_score + size_score) * (1 - quant_penalty)
 
-    # Weak / unverifiable evidence gets an extra discount.
     if not has_benchmark:
         quality_core *= 0.55
     elif is_self_reported:
-        quality_core *= 0.55  # uploader claim, easily fabricated
+        quality_core *= 0.55
     elif is_inherited:
         quality_core *= 0.78
 
-    # Runtime form factor penalty
     if fit_type == "partial_offload":
         quality_core *= 0.72
     elif fit_type == "cpu_only":
         quality_core *= 0.50
 
-    # Speed acts as a usability gate rather than a ranking primary.
     required_speed = (
         8.0
         if fit_type == "full_gpu"
@@ -519,7 +505,6 @@ def _compute_quality_score(
     else:
         speed_score = -8.0
 
-    # Popularity is a tie-breaker, never primary.
     downloads = max(model.downloads, family_downloads)
     likes = max(model.likes, family_likes)
     pop_score_raw = 0.0
@@ -531,14 +516,13 @@ def _compute_quality_score(
     if is_direct:
         pop_weight = 0.0
     elif is_self_reported:
-        pop_weight = 0.4  # uploader claim is weak — popularity acts as sanity check
+        pop_weight = 0.4
     elif has_benchmark:
         pop_weight = 0.2
     else:
         pop_weight = 0.6
     pop_score = pop_score_raw * pop_weight
 
-    # Source-trust bonus stays small.
     source_bonus_raw = 0.0
     org = model.id.split("/")[0] if "/" in model.id else ""
     if org in _OFFICIAL_ORGS:
@@ -563,22 +547,15 @@ def _compute_quality_score(
         source_weight = 0.6
     source_bonus = source_bonus_raw * source_weight
 
-    # Generation lineage bonus: newest in a known family gets a small boost,
-    # confirmed legacy versions get a small penalty. Helps surface Qwen3.6,
-    # DeepSeek V4, Gemma 4, etc. against accumulated download leaders.
     gen_bonus = _generation_bonus(model.id)
-    # When benchmark evidence is missing or self-reported, the lineage signal
-    # carries more weight (we have less else to go on).
     if not has_benchmark or is_self_reported:
         gen_bonus *= 1.5
     elif is_direct:
         gen_bonus *= 0.6
 
-    # Penalty for "uncensored / abliterated / heretic / RP" derivatives that
-    # ride on a base model's score without independent benchmarking.
     derivative_penalty = _derivative_name_penalty(model.id)
 
-    return max(
+    final_score = max(
         0.0,
         min(
             100.0,
@@ -590,6 +567,21 @@ def _compute_quality_score(
             + derivative_penalty,
         ),
     )
+
+    breakdown = ScoreBreakdown(
+        benchmark_source=benchmark_source,
+        benchmark_score_raw=benchmark_avg,
+        benchmark_confidence=0.0,
+        benchmark_weight=bench_weight,
+        size_score=size_score,
+        quant_penalty=quant_penalty,
+        fit_type=fit_type,
+        speed_score=speed_score,
+        quality_core=quality_core,
+        final_score=final_score,
+    )
+
+    return final_score, breakdown
 
 
 def rank_models(
@@ -736,7 +728,10 @@ def rank_models(
                 compat.fit_type,
                 tok_per_sec,
             )
-            compat.quality_score = _compute_quality_score(
+            (
+                compat.quality_score,
+                compat.score_breakdown,
+            ) = _compute_quality_score(
                 model,
                 variant,
                 tok_per_sec,
@@ -746,6 +741,8 @@ def rank_models(
                 benchmark_avg=bench_avg,
                 benchmark_source=bench_evidence.source,
             )
+            if compat.score_breakdown:
+                compat.score_breakdown.benchmark_confidence = bench_evidence.confidence
             # Map evidence source to a 4-value display status. "self_reported"
             # is shown distinctly so users can spot uploader-claimed numbers.
             if bench_evidence.score is None:

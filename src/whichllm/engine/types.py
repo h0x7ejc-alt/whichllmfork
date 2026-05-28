@@ -6,6 +6,20 @@ from whichllm.models.types import GGUFVariant, ModelInfo
 
 
 @dataclass
+class ScoreBreakdown:
+    benchmark_source: str = "none"
+    benchmark_score_raw: float | None = None
+    benchmark_confidence: float = 0.0
+    benchmark_weight: float = 0.0
+    size_score: float = 0.0
+    quant_penalty: float = 0.0
+    fit_type: str = "full_gpu"
+    speed_score: float = 0.0
+    quality_core: float = 0.0
+    final_score: float = 0.0
+
+
+@dataclass
 class CompatibilityResult:
     model: ModelInfo
     gguf_variant: GGUFVariant | None
@@ -22,3 +36,4 @@ class CompatibilityResult:
     benchmark_status: str = "none"  # "direct" | "estimated" | "self_reported" | "none"
     benchmark_source: str = "none"  # granular: "direct" | "variant" | "base_model" | "line_interp" | "self_reported" | "none"
     benchmark_confidence: float = 0.0  # 0.0-1.0 from BenchmarkEvidence
+    score_breakdown: ScoreBreakdown | None = None
