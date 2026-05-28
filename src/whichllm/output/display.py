@@ -240,6 +240,7 @@ def display_ranking(
     *,
     has_gpu: bool = True,
     show_status: bool = False,
+    explain: bool = False,
 ) -> None:
     """Display ranked model table."""
     if not results:
@@ -420,6 +421,29 @@ def display_ranking(
             "  [yellow]Task hint:[/] Specialized models detected in ranking: "
             + ", ".join(specialized)
         )
+
+    if explain:
+        console.print()
+        console.print("[bold]Score Breakdown (Top Models)[/bold]")
+        for i, r in enumerate(results[:3], 1):
+            bd = r.score_breakdown
+            if not bd:
+                continue
+            console.print(f"[cyan]#{i} {r.model.id}[/cyan] (Total: {r.quality_score:.1f})")
+            
+            src = bd.get("benchmark_source", "none")
+            conf = r.benchmark_confidence
+            console.print(f"  • Benchmark: {bd.get('benchmark_score', 0):.1f} (Source: {src}, Confidence: {conf:.2f})")
+            console.print(f"  • Size Score: {bd.get('size_score', 0):.1f}")
+            console.print(f"  • Quant Penalty: -{bd.get('quant_penalty', 0) * 100:.1f}%")
+            console.print(f"  • Quality Core: {bd.get('quality_core', 0):.1f}")
+            console.print(f"  • Fit Penalty/Bonus: {bd.get('fit_type', 'unknown')}")
+            console.print(f"  • Speed Score: {bd.get('speed_score', 0):.1f}")
+            console.print(f"  • Pop Score: {bd.get('pop_score', 0):.1f}")
+            console.print(f"  • Source Bonus: {bd.get('source_bonus', 0):.1f}")
+            console.print(f"  • Gen Bonus: {bd.get('gen_bonus', 0):.1f}")
+            if bd.get("derivative_penalty"):
+                console.print(f"  • Derivative Penalty: {bd.get('derivative_penalty', 0):.1f}")
 
     # Show warnings for top results
     for i, r in enumerate(results[:3], 1):

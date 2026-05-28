@@ -1,0 +1,129 @@
+diff --git a/src/whichllm/cli.py b/src/whichllm/cli.py
+index ebefb77..9170f05 100644
+--- a/src/whichllm/cli.py
++++ b/src/whichllm/cli.py
+@@ -238,6 +238,9 @@ def main(
+     vram: Optional[float] = typer.Option(
+         None, "--vram", help="Override VRAM in GB (requires --gpu)"
+     ),
++    explain: bool = typer.Option(
++        False, "--explain", help="Show score breakdown for top results"
++    ),
+ ):
+     """Detect hardware and recommend the best local LLMs."""
+     if ctx.invoked_subcommand is not None:
+@@ -379,7 +382,7 @@ def main(
+         console.print()
+         display_hardware(hardware)
+         console.print()
+-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
++        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status, explain=explain)
+         console.print()
+ 
+ 
+diff --git a/src/whichllm/engine/ranker.py b/src/whichllm/engine/ranker.py
+index 8210968..bfa24cf 100644
+--- a/src/whichllm/engine/ranker.py
++++ b/src/whichllm/engine/ranker.py
+@@ -443,7 +443,7 @@ def _compute_quality_score(
+     family_likes: int = 0,
+     benchmark_avg: float | None = None,
+     benchmark_source: str = "none",
+-) -> float:
++) -> tuple[float, dict[str, float | str]]:
+     """Compute a quality score (0-100) for ranking.
+ 
+     Factors:
+@@ -578,7 +578,7 @@ def _compute_quality_score(
+     # ride on a base model's score without independent benchmarking.
+     derivative_penalty = _derivative_name_penalty(model.id)
+ 
+-    return max(
++    final_score = max(
+         0.0,
+         min(
+             100.0,
+@@ -591,6 +591,22 @@ def _compute_quality_score(
+         ),
+     )
+ 
++    breakdown = {
++        "benchmark_source": benchmark_source,
++        "benchmark_score": benchmark_score,
++        "size_score": size_score,
++        "quant_penalty": quant_penalty,
++        "quality_core": quality_core,
++        "fit_type": fit_type,
++        "speed_score": speed_score,
++        "pop_score": pop_score,
++        "source_bonus": source_bonus,
++        "gen_bonus": gen_bonus,
++        "derivative_penalty": derivative_penalty,
++    }
++
++    return final_score, breakdown
++
+ 
+ def rank_models(
+     models: list[ModelInfo],
+@@ -736,7 +752,7 @@ def rank_models(
+                 compat.fit_type,
+                 tok_per_sec,
+             )
+-            compat.quality_score = _compute_quality_score(
++            compat.quality_score, compat.score_breakdown = _compute_quality_score(
+                 model,
+                 variant,
+                 tok_per_sec,
+diff --git a/src/whichllm/engine/types.py b/src/whichllm/engine/types.py
+index 1201429..8214a88 100644
+--- a/src/whichllm/engine/types.py
++++ b/src/whichllm/engine/types.py
+@@ -22,3 +22,5 @@ class CompatibilityResult:
+     benchmark_status: str = "none"  # "direct" | "estimated" | "self_reported" | "none"
+     benchmark_source: str = "none"  # granular: "direct" | "variant" | "base_model" | "line_interp" | "self_reported" | "none"
+     benchmark_confidence: float = 0.0  # 0.0-1.0 from BenchmarkEvidence
++    score_breakdown: dict[str, float | str] | None = None
++
+diff --git a/src/whichllm/output/display.py b/src/whichllm/output/display.py
+index 20fc8a9..c2f31e9 100644
+--- a/src/whichllm/output/display.py
++++ b/src/whichllm/output/display.py
+@@ -240,6 +240,7 @@ def display_ranking(
+     *,
+     has_gpu: bool = True,
+     show_status: bool = False,
++    explain: bool = False,
+ ) -> None:
+     """Display ranked model table."""
+     if not results:
+@@ -421,6 +422,29 @@ def display_ranking(
+             + ", ".join(specialized)
+         )
+ 
++    if explain:
++        console.print()
++        console.print("[bold]Score Breakdown (Top Models)[/bold]")
++        for i, r in enumerate(results[:3], 1):
++            bd = r.score_breakdown
++            if not bd:
++                continue
++            console.print(f"[cyan]#{i} {r.model.id}[/cyan] (Total: {r.quality_score:.1f})")
++            
++            src = bd.get("benchmark_source", "none")
++            conf = r.benchmark_confidence
++            console.print(f"  • Benchmark: {bd.get('benchmark_score', 0):.1f} (Source: {src}, Confidence: {conf:.2f})")
++            console.print(f"  • Size Score: {bd.get('size_score', 0):.1f}")
++            console.print(f"  • Quant Penalty: -{bd.get('quant_penalty', 0) * 100:.1f}%")
++            console.print(f"  • Quality Core: {bd.get('quality_core', 0):.1f}")
++            console.print(f"  • Fit Penalty/Bonus: {bd.get('fit_type', 'unknown')}")
++            console.print(f"  • Speed Score: {bd.get('speed_score', 0):.1f}")
++            console.print(f"  • Pop Score: {bd.get('pop_score', 0):.1f}")
++            console.print(f"  • Source Bonus: {bd.get('source_bonus', 0):.1f}")
++            console.print(f"  • Gen Bonus: {bd.get('gen_bonus', 0):.1f}")
++            if bd.get("derivative_penalty"):
++                console.print(f"  • Derivative Penalty: {bd.get('derivative_penalty', 0):.1f}")
++
+     # Show warnings for top results
+     for i, r in enumerate(results[:3], 1):
+         if r.warnings:

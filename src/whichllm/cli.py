@@ -238,6 +238,9 @@ def main(
     vram: Optional[float] = typer.Option(
         None, "--vram", help="Override VRAM in GB (requires --gpu)"
     ),
+    explain: bool = typer.Option(
+        False, "--explain", help="Show score breakdown for top results"
+    ),
 ):
     """Detect hardware and recommend the best local LLMs."""
     if ctx.invoked_subcommand is not None:
@@ -379,7 +382,7 @@ def main(
         console.print()
         display_hardware(hardware)
         console.print()
-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
+        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status, explain=explain)
         console.print()
 
 

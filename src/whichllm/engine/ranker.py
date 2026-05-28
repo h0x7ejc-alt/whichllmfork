@@ -443,7 +443,7 @@ def _compute_quality_score(
     family_likes: int = 0,
     benchmark_avg: float | None = None,
     benchmark_source: str = "none",
-) -> float:
+) -> tuple[float, dict[str, float | str]]:
     """Compute a quality score (0-100) for ranking.
 
     Factors:
@@ -578,7 +578,7 @@ def _compute_quality_score(
     # ride on a base model's score without independent benchmarking.
     derivative_penalty = _derivative_name_penalty(model.id)
 
-    return max(
+    final_score = max(
         0.0,
         min(
             100.0,
@@ -590,6 +590,22 @@ def _compute_quality_score(
             + derivative_penalty,
         ),
     )
+
+    breakdown = {
+        "benchmark_source": benchmark_source,
+        "benchmark_score": benchmark_score,
+        "size_score": size_score,
+        "quant_penalty": quant_penalty,
+        "quality_core": quality_core,
+        "fit_type": fit_type,
+        "speed_score": speed_score,
+        "pop_score": pop_score,
+        "source_bonus": source_bonus,
+        "gen_bonus": gen_bonus,
+        "derivative_penalty": derivative_penalty,
+    }
+
+    return final_score, breakdown
 
 
 def rank_models(
@@ -736,7 +752,7 @@ def rank_models(
                 compat.fit_type,
                 tok_per_sec,
             )
-            compat.quality_score = _compute_quality_score(
+            compat.quality_score, compat.score_breakdown = _compute_quality_score(
                 model,
                 variant,
                 tok_per_sec,
