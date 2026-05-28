@@ -190,6 +190,7 @@ def main(
         False, "--refresh", help="Ignore cache and re-fetch models"
     ),
     top: int = typer.Option(10, "--top", "-n", help="Number of top models to show"),
+    explain: bool = typer.Option(False, "--explain", help="Show score breakdown for top models"),
     context_length: int = typer.Option(
         4096,
         "--context-length",
@@ -379,7 +380,7 @@ def main(
         console.print()
         display_hardware(hardware)
         console.print()
-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
+        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status, explain=explain)
         console.print()
 
 

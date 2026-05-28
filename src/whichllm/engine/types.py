@@ -22,3 +22,13 @@ class CompatibilityResult:
     benchmark_status: str = "none"  # "direct" | "estimated" | "self_reported" | "none"
     benchmark_source: str = "none"  # granular: "direct" | "variant" | "base_model" | "line_interp" | "self_reported" | "none"
     benchmark_confidence: float = 0.0  # 0.0-1.0 from BenchmarkEvidence
+    # 评分拆解字段
+    benchmark_score: float = 0.0
+    size_score: float = 0.0
+    quant_penalty: float = 0.0
+    fit_penalty: float = 0.0
+    speed_score: float = 0.0
+    pop_score: float = 0.0
+    source_bonus: float = 0.0
+    gen_bonus: float = 0.0
+    derivative_penalty: float = 0.0

@@ -443,18 +443,11 @@ def _compute_quality_score(
     family_likes: int = 0,
     benchmark_avg: float | None = None,
     benchmark_source: str = "none",
-) -> float:
+) -> tuple[float, dict]:
     """Compute a quality score (0-100) for ranking.
 
-    Factors:
-    - Benchmark score weighted by source tier
-    - Model size (log scale)
-    - Quantization penalty
-    - Fit type penalty (partial offload / CPU-only heavily penalized)
-    - Speed bonus / penalty (practical usability)
-    - Popularity (downloads/likes) as soft tie-breaker
-    - Official org bonus (vs known repackagers)
-    - Generation-lineage bonus (newest family member > legacy generation)
+    Returns:
+        tuple: (quality_score, {benchmark_score, size_score, quant_penalty, fit_penalty, speed_score, pop_score, source_bonus, gen_bonus, derivative_penalty})
     """
     params_b = model.parameter_count / 1e9
     if model.is_moe and model.parameter_count_active:
@@ -463,7 +456,7 @@ def _compute_quality_score(
         effective_b = params_b
 
     if effective_b <= 0:
-        return 0.0
+        return 0.0, {}
 
     # Benchmarks lead, but raw model size also matters: a 70B at Q4_K_M
     # carries far more world knowledge than a 7B Q4_K_M even when the
@@ -500,10 +493,13 @@ def _compute_quality_score(
         quality_core *= 0.78
 
     # Runtime form factor penalty
+    fit_penalty_multiplier = 1.0
     if fit_type == "partial_offload":
-        quality_core *= 0.72
+        fit_penalty_multiplier = 0.72
     elif fit_type == "cpu_only":
-        quality_core *= 0.50
+        fit_penalty_multiplier = 0.50
+    quality_core *= fit_penalty_multiplier
+    fit_penalty = (1 - fit_penalty_multiplier) * (benchmark_score + size_score) * (1 - quant_penalty)
 
     # Speed acts as a usability gate rather than a ranking primary.
     required_speed = (
@@ -511,6 +507,7 @@ def _compute_quality_score(
         if fit_type == "full_gpu"
         else (4.0 if fit_type == "partial_offload" else 1.5)
     )
+    speed_score = 0.0
     if tok_per_sec > 0:
         if tok_per_sec < required_speed:
             speed_score = -8.0 * (1 - (tok_per_sec / required_speed))
@@ -578,7 +575,7 @@ def _compute_quality_score(
     # ride on a base model's score without independent benchmarking.
     derivative_penalty = _derivative_name_penalty(model.id)
 
-    return max(
+    final_score = max(
         0.0,
         min(
             100.0,
@@ -590,6 +587,20 @@ def _compute_quality_score(
             + derivative_penalty,
         ),
     )
+
+    breakdown = {
+        "benchmark_score": benchmark_score,
+        "size_score": size_score,
+        "quant_penalty": quant_penalty,
+        "fit_penalty": fit_penalty,
+        "speed_score": speed_score,
+        "pop_score": pop_score,
+        "source_bonus": source_bonus,
+        "gen_bonus": gen_bonus,
+        "derivative_penalty": derivative_penalty,
+    }
+
+    return final_score, breakdown
 
 
 def rank_models(
@@ -736,7 +747,7 @@ def rank_models(
                 compat.fit_type,
                 tok_per_sec,
             )
-            compat.quality_score = _compute_quality_score(
+            compat.quality_score, breakdown = _compute_quality_score(
                 model,
                 variant,
                 tok_per_sec,
@@ -746,6 +757,16 @@ def rank_models(
                 benchmark_avg=bench_avg,
                 benchmark_source=bench_evidence.source,
             )
+            # 保存评分拆解信息
+            compat.benchmark_score = breakdown.get("benchmark_score", 0.0)
+            compat.size_score = breakdown.get("size_score", 0.0)
+            compat.quant_penalty = breakdown.get("quant_penalty", 0.0)
+            compat.fit_penalty = breakdown.get("fit_penalty", 0.0)
+            compat.speed_score = breakdown.get("speed_score", 0.0)
+            compat.pop_score = breakdown.get("pop_score", 0.0)
+            compat.source_bonus = breakdown.get("source_bonus", 0.0)
+            compat.gen_bonus = breakdown.get("gen_bonus", 0.0)
+            compat.derivative_penalty = breakdown.get("derivative_penalty", 0.0)
             # Map evidence source to a 4-value display status. "self_reported"
             # is shown distinctly so users can spot uploader-claimed numbers.
             if bench_evidence.score is None:

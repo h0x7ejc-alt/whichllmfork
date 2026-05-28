@@ -240,6 +240,7 @@ def display_ranking(
     *,
     has_gpu: bool = True,
     show_status: bool = False,
+    explain: bool = False,
 ) -> None:
     """Display ranked model table."""
     if not results:
@@ -331,6 +332,11 @@ def display_ranking(
         table.add_row(*row_cells)
 
     console.print(table)
+
+    # 如果启用了 explain，显示评分拆解
+    if explain:
+        console.print()
+        display_score_breakdown(results)
 
     # Score legend
     has_estimated = any(r.benchmark_status == "estimated" for r in results)
@@ -426,6 +432,72 @@ def display_ranking(
         if r.warnings:
             for w in r.warnings:
                 console.print(f"  [yellow]Warning #{i} {r.model.name}:[/] {w}")
+
+
+def display_score_breakdown(results: list[CompatibilityResult]) -> None:
+    """Display detailed score breakdown for top models."""
+    console.print("[bold]Score Breakdown[/bold]")
+
+    for i, r in enumerate(results, 1):
+        model_name = r.model.id
+        console.print()
+        console.print(f"[cyan]#{i}: {model_name}[/cyan]")
+        console.print(f"  Final Score: {r.quality_score:.2f}")
+        console.print(f"  Benchmark Source: {r.benchmark_source} (confidence: {r.benchmark_confidence:.2f})")
+
+        table = Table(show_header=True, show_lines=False)
+        table.add_column("Component", style="bold")
+        table.add_column("Value", justify="right")
+        table.add_column("Description")
+
+        table.add_row(
+            "Benchmark Score",
+            f"{r.benchmark_score:.2f}",
+            "Weighted performance on leaderboards"
+        )
+        table.add_row(
+            "Size Score",
+            f"{r.size_score:.2f}",
+            "Knowledge capacity from parameter count"
+        )
+        table.add_row(
+            "Quant Penalty",
+            f"{-r.quant_penalty * 100:.1f}%",
+            "Quality loss from quantization"
+        )
+        table.add_row(
+            "Fit Penalty",
+            f"{-r.fit_penalty:.2f}",
+            "Penalty for partial offload/CPU-only"
+        )
+        table.add_row(
+            "Speed Score",
+            f"{r.speed_score:.2f}",
+            "Usability bonus/penalty from speed"
+        )
+        table.add_row(
+            "Popularity Score",
+            f"{r.pop_score:.2f}",
+            "Tie-breaker from downloads/likes"
+        )
+        table.add_row(
+            "Source Bonus",
+            f"{r.source_bonus:.2f}",
+            "Bonus/penalty for official repo/converter"
+        )
+        table.add_row(
+            "Generation Bonus",
+            f"{r.gen_bonus:.2f}",
+            "Bonus for newer model generations"
+        )
+        if r.derivative_penalty != 0:
+            table.add_row(
+                "Derivative Penalty",
+                f"{r.derivative_penalty:.2f}",
+                "Penalty for unbenchmarked derivatives"
+            )
+
+        console.print(table)
 
 
 def display_plan(
