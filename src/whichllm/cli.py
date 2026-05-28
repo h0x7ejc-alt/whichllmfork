@@ -232,6 +232,11 @@ def main(
     cpu_only: bool = typer.Option(
         False, "--cpu-only", help="Ignore GPU and run in CPU-only mode"
     ),
+    explain: bool = typer.Option(
+        False,
+        "--explain",
+        help="Show detailed score breakdown for top results",
+    ),
     gpu: Optional[str] = typer.Option(
         None, "--gpu", help="Simulate a GPU (e.g. 'RTX 4090')"
     ),
@@ -264,7 +269,7 @@ def main(
         models_to_dicts,
     )
     from whichllm.models.grouper import group_models
-    from whichllm.output.display import display_hardware, display_json, display_ranking
+    from whichllm.output.display import display_hardware, display_json, display_ranking, display_explain
 
     with Progress(
         SpinnerColumn(),
@@ -380,6 +385,8 @@ def main(
         display_hardware(hardware)
         console.print()
         display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
+        if explain and results:
+            display_explain(results)
         console.print()
 
 

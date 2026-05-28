@@ -1,0 +1,283 @@
+diff --git a/src/whichllm/cli.py b/src/whichllm/cli.py
+index ebefb77..b20e402 100644
+--- a/src/whichllm/cli.py
++++ b/src/whichllm/cli.py
+@@ -232,6 +232,11 @@ def main(
+     cpu_only: bool = typer.Option(
+         False, "--cpu-only", help="Ignore GPU and run in CPU-only mode"
+     ),
++    explain: bool = typer.Option(
++        False,
++        "--explain",
++        help="Show detailed score breakdown for top results",
++    ),
+     gpu: Optional[str] = typer.Option(
+         None, "--gpu", help="Simulate a GPU (e.g. 'RTX 4090')"
+     ),
+@@ -264,7 +269,7 @@ def main(
+         models_to_dicts,
+     )
+     from whichllm.models.grouper import group_models
+-    from whichllm.output.display import display_hardware, display_json, display_ranking
++    from whichllm.output.display import display_hardware, display_json, display_ranking, display_explain
+ 
+     with Progress(
+         SpinnerColumn(),
+@@ -380,6 +385,8 @@ def main(
+         display_hardware(hardware)
+         console.print()
+         display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
++        if explain and results:
++            display_explain(results)
+         console.print()
+ 
+ 
+diff --git a/src/whichllm/engine/ranker.py b/src/whichllm/engine/ranker.py
+index 8210968..93732d7 100644
+--- a/src/whichllm/engine/ranker.py
++++ b/src/whichllm/engine/ranker.py
+@@ -443,6 +443,7 @@ def _compute_quality_score(
+     family_likes: int = 0,
+     benchmark_avg: float | None = None,
+     benchmark_source: str = "none",
++    compat: CompatibilityResult | None = None,
+ ) -> float:
+     """Compute a quality score (0-100) for ranking.
+ 
+@@ -492,18 +493,22 @@ def _compute_quality_score(
+     quality_core = (benchmark_score + size_score) * (1 - quant_penalty)
+ 
+     # Weak / unverifiable evidence gets an extra discount.
++    evidence_multiplier = 1.0
+     if not has_benchmark:
+-        quality_core *= 0.55
++        evidence_multiplier = 0.55
+     elif is_self_reported:
+-        quality_core *= 0.55  # uploader claim, easily fabricated
++        evidence_multiplier = 0.55
+     elif is_inherited:
+-        quality_core *= 0.78
++        evidence_multiplier = 0.78
++    quality_core *= evidence_multiplier
+ 
+     # Runtime form factor penalty
++    fit_multiplier = 1.0
+     if fit_type == "partial_offload":
+-        quality_core *= 0.72
++        fit_multiplier = 0.72
+     elif fit_type == "cpu_only":
+-        quality_core *= 0.50
++        fit_multiplier = 0.50
++    quality_core *= fit_multiplier
+ 
+     # Speed acts as a usability gate rather than a ranking primary.
+     required_speed = (
+@@ -578,7 +583,8 @@ def _compute_quality_score(
+     # ride on a base model's score without independent benchmarking.
+     derivative_penalty = _derivative_name_penalty(model.id)
+ 
+-    return max(
++    final_quality_core = quality_core  # capture before bonuses
++    final_score = max(
+         0.0,
+         min(
+             100.0,
+@@ -591,6 +597,21 @@ def _compute_quality_score(
+         ),
+     )
+ 
++    if compat is not None:
++        compat.score_benchmark = benchmark_score
++        compat.score_size = size_score
++        compat.score_quant_penalty = quant_penalty
++        compat.score_evidence_multiplier = evidence_multiplier
++        compat.score_fit_multiplier = fit_multiplier
++        compat.score_speed = speed_score
++        compat.score_pop = pop_score
++        compat.score_source_bonus = source_bonus
++        compat.score_gen_bonus = gen_bonus
++        compat.score_derivative_penalty = derivative_penalty
++        compat.score_quality_core = final_quality_core
++
++    return final_score
++
+ 
+ def rank_models(
+     models: list[ModelInfo],
+@@ -745,6 +766,7 @@ def rank_models(
+                 family_likes=family_max_likes.get(fid, 0),
+                 benchmark_avg=bench_avg,
+                 benchmark_source=bench_evidence.source,
++                compat=compat,
+             )
+             # Map evidence source to a 4-value display status. "self_reported"
+             # is shown distinctly so users can spot uploader-claimed numbers.
+diff --git a/src/whichllm/engine/types.py b/src/whichllm/engine/types.py
+index 1201429..9cb1e81 100644
+--- a/src/whichllm/engine/types.py
++++ b/src/whichllm/engine/types.py
+@@ -22,3 +22,16 @@ class CompatibilityResult:
+     benchmark_status: str = "none"  # "direct" | "estimated" | "self_reported" | "none"
+     benchmark_source: str = "none"  # granular: "direct" | "variant" | "base_model" | "line_interp" | "self_reported" | "none"
+     benchmark_confidence: float = 0.0  # 0.0-1.0 from BenchmarkEvidence
++
++    # Score breakdown fields for --explain
++    score_benchmark: float = 0.0
++    score_size: float = 0.0
++    score_quant_penalty: float = 0.0
++    score_evidence_multiplier: float = 1.0
++    score_fit_multiplier: float = 1.0
++    score_speed: float = 0.0
++    score_pop: float = 0.0
++    score_source_bonus: float = 0.0
++    score_gen_bonus: float = 0.0
++    score_derivative_penalty: float = 0.0
++    score_quality_core: float = 0.0
+diff --git a/src/whichllm/output/display.py b/src/whichllm/output/display.py
+index 20fc8a9..fb33061 100644
+--- a/src/whichllm/output/display.py
++++ b/src/whichllm/output/display.py
+@@ -13,6 +13,7 @@ from rich.table import Table
+ from rich.text import Text
+ 
+ from whichllm.engine.quantization import effective_quant_type, estimate_weight_bytes
++from whichllm.engine.ranker import _SOURCE_WEIGHTS
+ from whichllm.engine.types import CompatibilityResult
+ from whichllm.hardware.types import HardwareInfo
+ from whichllm.models.types import GGUFVariant, ModelInfo
+@@ -878,3 +879,135 @@ def display_upgrade_json(
+             ensure_ascii=False,
+         )
+     )
++
++
++def display_explain(results: list[CompatibilityResult]) -> None:
++    source_labels: dict[str, str] = {
++        "direct": "Direct benchmark match",
++        "variant": "Variant match",
++        "base_model": "Base model match",
++        "line_interp": "Line interpolation",
++        "self_reported": "Uploader-reported (unverified)",
++        "none": "No benchmark data",
++    }
++    fit_labels: dict[str, tuple[str, str]] = {
++        "full_gpu": ("Full GPU", "green"),
++        "partial_offload": ("Partial offload", "yellow"),
++        "cpu_only": ("CPU only", "red"),
++    }
++
++    for i, r in enumerate(results, 1):
++        model_name = r.model.id
++        quant = effective_quant_type(r.model, r.gguf_variant)
++        fit_label, fit_color = fit_labels.get(r.fit_type, (r.fit_type, "white"))
++
++        table = Table(
++            title=f"#{i} {model_name} ([{fit_color}]{fit_label}[/{fit_color}], {quant})",
++            show_header=False,
++            border_style="blue",
++            padding=(0, 1),
++        )
++        table.add_column("Component", style="bold cyan", width=28)
++        table.add_column("Detail", width=22)
++        table.add_column("Value", justify="right", width=8)
++
++        source_desc = source_labels.get(r.benchmark_source, r.benchmark_source)
++        conf_str = f"{r.benchmark_confidence:.0%}" if r.benchmark_confidence else "—"
++        table.add_row(
++            "Benchmark source",
++            f"{source_desc}",
++            f"conf={conf_str}",
++        )
++
++        table.add_row(
++            "Benchmark contribution",
++            f"weight={_SOURCE_WEIGHTS.get(r.benchmark_source, 0):.2f} × raw",
++            f"{r.score_benchmark:+.1f}",
++        )
++
++        table.add_row(
++            "Size score",
++            f"log₂(params) → capped at 35",
++            f"{r.score_size:+.1f}",
++        )
++
++        table.add_row(
++            "Quantization penalty",
++            f"{(r.score_quant_penalty * 100):.0f}% quality loss",
++            f"-{(r.score_benchmark + r.score_size) * r.score_quant_penalty:.1f}" if r.score_quant_penalty > 0 else "—",
++        )
++
++        table.add_row(
++            "Evidence confidence multiplier",
++            f"×{r.score_evidence_multiplier:.2f}",
++            "",
++        )
++
++        table.add_row(
++            "Fit penalty multiplier",
++            f"×{r.score_fit_multiplier:.2f}",
++            "",
++        )
++
++        table.add_row(
++            "Quality core (after mults.)",
++            "",
++            f"{r.score_quality_core:.1f}",
++        )
++
++        if r.score_speed != 0:
++            speed_label = "bonus" if r.score_speed > 0 else "penalty"
++            table.add_row(
++                f"Speed {speed_label}",
++                f"{r.estimated_tok_per_sec:.1f} tok/s" if r.estimated_tok_per_sec else "N/A",
++                f"{r.score_speed:+.1f}",
++            )
++
++        if r.score_pop != 0:
++            table.add_row(
++                "Popularity",
++                "",
++                f"{r.score_pop:+.1f}",
++            )
++
++        if r.score_source_bonus != 0:
++            table.add_row(
++                "Source trust",
++                "",
++                f"{r.score_source_bonus:+.1f}",
++            )
++
++        if r.score_gen_bonus != 0:
++            table.add_row(
++                "Generation lineage",
++                "",
++                f"{r.score_gen_bonus:+.1f}",
++            )
++
++        if r.score_derivative_penalty != 0:
++            table.add_row(
++                "Derivative penalty",
++                "",
++                f"{r.score_derivative_penalty:+.1f}",
++            )
++
++        table.add_row(
++            "",
++            "",
++            "",
++        )
++        table.add_row(
++            "[bold]Final score[/bold]",
++            "",
++            f"[bold green]{r.quality_score:.1f}[/bold green]",
++            style="bold",
++        )
++
++        console.print(table)
++        console.print()
++
++    from whichllm.models.benchmark_sources import BENCHMARK_SNAPSHOT
++
++    console.print(
++        f"  [dim]Benchmark reference: {BENCHMARK_SNAPSHOT}[/dim]"
++    )

@@ -13,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from whichllm.engine.quantization import effective_quant_type, estimate_weight_bytes
+from whichllm.engine.ranker import _SOURCE_WEIGHTS
 from whichllm.engine.types import CompatibilityResult
 from whichllm.hardware.types import HardwareInfo
 from whichllm.models.types import GGUFVariant, ModelInfo
@@ -877,4 +878,136 @@ def display_upgrade_json(
             {"current": current_row, "targets": rows},
             ensure_ascii=False,
         )
+    )
+
+
+def display_explain(results: list[CompatibilityResult]) -> None:
+    source_labels: dict[str, str] = {
+        "direct": "Direct benchmark match",
+        "variant": "Variant match",
+        "base_model": "Base model match",
+        "line_interp": "Line interpolation",
+        "self_reported": "Uploader-reported (unverified)",
+        "none": "No benchmark data",
+    }
+    fit_labels: dict[str, tuple[str, str]] = {
+        "full_gpu": ("Full GPU", "green"),
+        "partial_offload": ("Partial offload", "yellow"),
+        "cpu_only": ("CPU only", "red"),
+    }
+
+    for i, r in enumerate(results, 1):
+        model_name = r.model.id
+        quant = effective_quant_type(r.model, r.gguf_variant)
+        fit_label, fit_color = fit_labels.get(r.fit_type, (r.fit_type, "white"))
+
+        table = Table(
+            title=f"#{i} {model_name} ([{fit_color}]{fit_label}[/{fit_color}], {quant})",
+            show_header=False,
+            border_style="blue",
+            padding=(0, 1),
+        )
+        table.add_column("Component", style="bold cyan", width=28)
+        table.add_column("Detail", width=22)
+        table.add_column("Value", justify="right", width=8)
+
+        source_desc = source_labels.get(r.benchmark_source, r.benchmark_source)
+        conf_str = f"{r.benchmark_confidence:.0%}" if r.benchmark_confidence else "—"
+        table.add_row(
+            "Benchmark source",
+            f"{source_desc}",
+            f"conf={conf_str}",
+        )
+
+        table.add_row(
+            "Benchmark contribution",
+            f"weight={_SOURCE_WEIGHTS.get(r.benchmark_source, 0):.2f} × raw",
+            f"{r.score_benchmark:+.1f}",
+        )
+
+        table.add_row(
+            "Size score",
+            f"log₂(params) → capped at 35",
+            f"{r.score_size:+.1f}",
+        )
+
+        table.add_row(
+            "Quantization penalty",
+            f"{(r.score_quant_penalty * 100):.0f}% quality loss",
+            f"-{(r.score_benchmark + r.score_size) * r.score_quant_penalty:.1f}" if r.score_quant_penalty > 0 else "—",
+        )
+
+        table.add_row(
+            "Evidence confidence multiplier",
+            f"×{r.score_evidence_multiplier:.2f}",
+            "",
+        )
+
+        table.add_row(
+            "Fit penalty multiplier",
+            f"×{r.score_fit_multiplier:.2f}",
+            "",
+        )
+
+        table.add_row(
+            "Quality core (after mults.)",
+            "",
+            f"{r.score_quality_core:.1f}",
+        )
+
+        if r.score_speed != 0:
+            speed_label = "bonus" if r.score_speed > 0 else "penalty"
+            table.add_row(
+                f"Speed {speed_label}",
+                f"{r.estimated_tok_per_sec:.1f} tok/s" if r.estimated_tok_per_sec else "N/A",
+                f"{r.score_speed:+.1f}",
+            )
+
+        if r.score_pop != 0:
+            table.add_row(
+                "Popularity",
+                "",
+                f"{r.score_pop:+.1f}",
+            )
+
+        if r.score_source_bonus != 0:
+            table.add_row(
+                "Source trust",
+                "",
+                f"{r.score_source_bonus:+.1f}",
+            )
+
+        if r.score_gen_bonus != 0:
+            table.add_row(
+                "Generation lineage",
+                "",
+                f"{r.score_gen_bonus:+.1f}",
+            )
+
+        if r.score_derivative_penalty != 0:
+            table.add_row(
+                "Derivative penalty",
+                "",
+                f"{r.score_derivative_penalty:+.1f}",
+            )
+
+        table.add_row(
+            "",
+            "",
+            "",
+        )
+        table.add_row(
+            "[bold]Final score[/bold]",
+            "",
+            f"[bold green]{r.quality_score:.1f}[/bold green]",
+            style="bold",
+        )
+
+        console.print(table)
+        console.print()
+
+    from whichllm.models.benchmark_sources import BENCHMARK_SNAPSHOT
+
+    console.print(
+        f"  [dim]Benchmark reference: {BENCHMARK_SNAPSHOT}[/dim]"
     )

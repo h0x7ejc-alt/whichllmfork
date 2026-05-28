@@ -443,6 +443,7 @@ def _compute_quality_score(
     family_likes: int = 0,
     benchmark_avg: float | None = None,
     benchmark_source: str = "none",
+    compat: CompatibilityResult | None = None,
 ) -> float:
     """Compute a quality score (0-100) for ranking.
 
@@ -492,18 +493,22 @@ def _compute_quality_score(
     quality_core = (benchmark_score + size_score) * (1 - quant_penalty)
 
     # Weak / unverifiable evidence gets an extra discount.
+    evidence_multiplier = 1.0
     if not has_benchmark:
-        quality_core *= 0.55
+        evidence_multiplier = 0.55
     elif is_self_reported:
-        quality_core *= 0.55  # uploader claim, easily fabricated
+        evidence_multiplier = 0.55
     elif is_inherited:
-        quality_core *= 0.78
+        evidence_multiplier = 0.78
+    quality_core *= evidence_multiplier
 
     # Runtime form factor penalty
+    fit_multiplier = 1.0
     if fit_type == "partial_offload":
-        quality_core *= 0.72
+        fit_multiplier = 0.72
     elif fit_type == "cpu_only":
-        quality_core *= 0.50
+        fit_multiplier = 0.50
+    quality_core *= fit_multiplier
 
     # Speed acts as a usability gate rather than a ranking primary.
     required_speed = (
@@ -578,7 +583,8 @@ def _compute_quality_score(
     # ride on a base model's score without independent benchmarking.
     derivative_penalty = _derivative_name_penalty(model.id)
 
-    return max(
+    final_quality_core = quality_core  # capture before bonuses
+    final_score = max(
         0.0,
         min(
             100.0,
@@ -590,6 +596,21 @@ def _compute_quality_score(
             + derivative_penalty,
         ),
     )
+
+    if compat is not None:
+        compat.score_benchmark = benchmark_score
+        compat.score_size = size_score
+        compat.score_quant_penalty = quant_penalty
+        compat.score_evidence_multiplier = evidence_multiplier
+        compat.score_fit_multiplier = fit_multiplier
+        compat.score_speed = speed_score
+        compat.score_pop = pop_score
+        compat.score_source_bonus = source_bonus
+        compat.score_gen_bonus = gen_bonus
+        compat.score_derivative_penalty = derivative_penalty
+        compat.score_quality_core = final_quality_core
+
+    return final_score
 
 
 def rank_models(
@@ -745,6 +766,7 @@ def rank_models(
                 family_likes=family_max_likes.get(fid, 0),
                 benchmark_avg=bench_avg,
                 benchmark_source=bench_evidence.source,
+                compat=compat,
             )
             # Map evidence source to a 4-value display status. "self_reported"
             # is shown distinctly so users can spot uploader-claimed numbers.
